@@ -4,5 +4,4 @@ pandas
 numpy
 ta
 plotly
-requests
-requests-cache
+redis
