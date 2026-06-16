@@ -310,322 +310,316 @@ st.set_page_config(page_title="Stock Analyzer", page_icon="📊", layout="wide")
 st.title("📊 Stock Analyzer")
 st.caption("Fundamentals · Growth · Profitability · DCF Valuation · Peer Comparison · Technicals")
 
+# --- Ticker input ---
 col_in, col_btn = st.columns([3, 1])
 with col_in:
-    symbol = st.text_input("Ticker Symbol", value="AAPL", label_visibility="collapsed").strip().upper()
+    symbol = st.text_input("Ticker Symbol", value=st.session_state.get("last_symbol", "AAPL"),
+                           label_visibility="collapsed").strip().upper()
 with col_btn:
     analyze = st.button("Analyze", type="primary", use_container_width=True)
 
+# Fetch data only when Analyze is clicked; store in session_state so sliders
+# and other widgets don't trigger a fresh fetch / wipe the results.
 if analyze and symbol:
     with st.spinner(f"Fetching data for {symbol}..."):
         data = fetch_all(symbol)
-
     if "error" in data:
         st.error(data["error"])
         st.stop()
+    st.session_state["data"]        = data
+    st.session_state["last_symbol"] = symbol
+    st.session_state["peer_infos"]  = None   # reset peers when new ticker analyzed
 
-    info    = data["info"]
-    hist    = data["hist"]
-    inc     = data["income_stmt"]
-    bal     = data["balance_sheet"]
-    cf_stmt = data["cashflow"]
-
-    # Header
-    name = info.get("longName", symbol)
-    price = sg(info, "currentPrice", "regularMarketPrice")
-    st.header(f"{name} ({symbol})")
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Price",      f"${price}" if price else "N/A")
-    c2.metric("Market Cap", fmt_money(info.get("marketCap")))
-    c3.metric("Sector",     info.get("sector", "N/A"))
-    c4.metric("Industry",   info.get("industry", "N/A"))
-
-    # Compute
-    val  = compute_valuation(info)
-    grw  = compute_growth(info, inc)
-    prof = compute_profitability(info)
-    hlth = compute_health(info)
-    fut  = compute_future(info)
-    tech = compute_technicals(hist)
-
-    cat_scores = {
-        "Valuation":     score_val(val),
-        "Growth":        score_growth(grw),
-        "Profitability": score_profit(prof),
-        "Future Outlook":score_future(fut),
-        "Technicals":    score_tech(tech),
-    }
-    total, verd, color = get_verdict(cat_scores)
-
-    # Verdict banner
-    st.markdown("---")
-    v1, v2 = st.columns([1, 2])
-    with v1:
-        st.markdown(f"### Verdict: :{color}[{verd}]")
-        st.markdown(f"**Composite Score:** {total:+.2f}  (−1 undervalued → +1 overvalued)")
-    with v2:
-        st.dataframe(pd.DataFrame({
-            "Category": list(cat_scores.keys()),
-            "Score":    [f"{v:+.2f}" for v in cat_scores.values()],
-            "Weight":   [f"{WEIGHTS[c]:.0%}" for c in cat_scores],
-        }), hide_index=True, use_container_width=True)
-    st.caption("Heuristic screen only — not investment advice.")
-
-    # Price chart
-    st.markdown("---")
-    st.subheader("Price Chart (2Y)")
-    if not hist.empty:
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(x=hist.index, y=hist["Close"], name="Close", line=dict(color="#1f77b4")))
-        if len(hist) >= 50:
-            fig.add_trace(go.Scatter(x=hist.index, y=hist["Close"].rolling(50).mean(),
-                                     name="50-Day MA", line=dict(color="orange", dash="dot")))
-        if len(hist) >= 200:
-            fig.add_trace(go.Scatter(x=hist.index, y=hist["Close"].rolling(200).mean(),
-                                     name="200-Day MA", line=dict(color="red", dash="dot")))
-        fig.update_layout(height=380, margin=dict(l=10, r=10, t=10, b=10))
-        st.plotly_chart(fig, use_container_width=True)
-
-    # -----------------------------------------------------------------------
-    # Tabs
-    # -----------------------------------------------------------------------
-    st.markdown("---")
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
-        "Valuation", "Growth", "Profitability & Health",
-        "Future Outlook", "Technicals",
-        "📐 DCF Calculator", "👥 Peer Comparison"
-    ])
-
-    PCT_GRW  = ["Revenue Growth (YoY)", "Earnings Growth (YoY)",
-                "Quarterly Earnings Growth (YoY)", "Revenue 3-4Y CAGR", "Net Income 3-4Y CAGR"]
-    PCT_PROF = ["Gross Margin", "Operating Margin", "Net Margin", "ROE", "ROA"]
-    PCT_FUT  = ["Implied Upside"]
-    PCT_TECH = ["% From 52W High", "% From 52W Low"]
-    MON_FUT  = ["Current Price", "Analyst Target Mean", "Analyst Target High", "Analyst Target Low"]
-    MON_TECH = ["Current Price", "50-Day MA", "200-Day MA", "52-Week High", "52-Week Low"]
-
-    with tab1: show_table(val)
-    with tab2: show_table(grw, pct_keys=PCT_GRW)
-    with tab3:
-        st.markdown("**Profitability**")
-        show_table(prof, pct_keys=PCT_PROF)
-        st.markdown("**Financial Health**")
-        show_table(hlth, money_keys=["Free Cash Flow"])
-    with tab4: show_table(fut, pct_keys=PCT_FUT, money_keys=MON_FUT)
-    with tab5: show_table(tech, pct_keys=PCT_TECH, money_keys=MON_TECH)
-
-    # -----------------------------------------------------------------------
-    # DCF Calculator
-    # -----------------------------------------------------------------------
-    with tab6:
-        st.subheader("📐 DCF Intrinsic Value Calculator")
-        st.caption("Adjust the sliders. The model projects free cash flows and discounts them back to today.")
-
-        # Pull defaults from yfinance
-        try:
-            base_fcf  = cf_stmt.loc["Free Cash Flow"].iloc[0]  if cf_stmt is not None and not cf_stmt.empty  else None
-        except Exception:
-            base_fcf  = sg(info, "freeCashflow")
-        try:
-            base_rev  = inc.loc["Total Revenue"].iloc[0] if inc is not None and not inc.empty else None
-        except Exception:
-            base_rev  = sg(info, "totalRevenue")
-
-        shares    = sg(info, "sharesOutstanding", "impliedSharesOutstanding")
-        try:
-            total_debt = bal.loc["Total Debt"].iloc[0]  if bal is not None and not bal.empty else 0
-        except Exception:
-            total_debt = 0
-        try:
-            cash_val   = bal.loc["Cash And Cash Equivalents"].iloc[0] if bal is not None and not bal.empty else 0
-        except Exception:
-            cash_val   = sg(info, "totalCash", default=0)
-
-        net_debt  = (total_debt or 0) - (cash_val or 0)
-        cur_price = sg(info, "currentPrice", "regularMarketPrice")
-
-        st.markdown("**Company Financials (auto-filled from latest filings)**")
-        d1, d2, d3, d4 = st.columns(4)
-        d1.metric("Latest FCF",     fmt_money(base_fcf))
-        d2.metric("Latest Revenue", fmt_money(base_rev))
-        d3.metric("Net Debt",       fmt_money(net_debt))
-        d4.metric("Shares Out.",    fmt_money(shares))
-
-        st.markdown("**Your Assumptions**")
-        a1, a2, a3, a4 = st.columns(4)
-        growth_rate     = a1.slider("FCF Growth Rate",     0, 40, 10, 1, format="%d%%") / 100
-        terminal_growth = a2.slider("Terminal Growth Rate", 0, 5, 2, format="%d%%") / 100
-        discount_rate   = a3.slider("Discount Rate (WACC)", 5, 20, 10, 1, format="%d%%") / 100
-        proj_years      = a4.slider("Projection Years",    5, 15, 10)
-
-        if discount_rate <= terminal_growth:
-            st.error("Discount rate must be greater than terminal growth rate.")
-        else:
-            intrinsic, cf_rows, tv_pv = run_dcf(
-                base_fcf, base_rev, growth_rate, terminal_growth,
-                discount_rate, proj_years, shares, net_debt
-            )
-
-            if intrinsic is None:
-                st.warning("Not enough data to run DCF — missing FCF or share count.")
-            else:
-                mos = (intrinsic - cur_price) / intrinsic if cur_price else None
-                r1, r2, r3 = st.columns(3)
-                r1.metric("Intrinsic Value / Share", f"${intrinsic:.2f}")
-                r2.metric("Current Price", f"${cur_price:.2f}" if cur_price else "N/A")
-                if mos is not None:
-                    lbl = "Upside" if mos > 0 else "Downside"
-                    tag = "Undervalued" if mos > 0 else "Overvalued"
-                    r3.metric(lbl, f"{mos * 100:.1f}%", delta=tag,
-                              delta_color="normal" if mos > 0 else "inverse")
-
-                # Bar chart
-                st.markdown("**Present Value Breakdown**")
-                df_cf = pd.DataFrame(cf_rows)
-                fig_d = go.Figure(go.Bar(
-                    x=df_cf["Year"].tolist() + ["Terminal Value"],
-                    y=df_cf["PV ($M)"].tolist() + [tv_pv],
-                    marker_color=["#1f77b4"] * len(df_cf) + ["#ff7f0e"]
-                ))
-                fig_d.update_layout(title="PV of Projected FCFs + Terminal Value ($M)",
-                                    height=340, margin=dict(l=10, r=10, t=40, b=10))
-                st.plotly_chart(fig_d, use_container_width=True)
-
-                # Sensitivity table
-                st.markdown("**Sensitivity Table — Intrinsic Value / Share**")
-                g_range = [round(growth_rate + d, 2) for d in [-0.04, -0.02, 0, 0.02, 0.04]]
-                d_range = [round(discount_rate + d, 3) for d in [-0.02, -0.01, 0, 0.01, 0.02]]
-                d_valid = [d for d in d_range if d > terminal_growth and d > 0]
-
-                sens = {}
-                for dr in d_valid:
-                    col_vals = []
-                    for gr in g_range:
-                        iv, _, _ = run_dcf(base_fcf, base_rev, gr, terminal_growth,
-                                           dr, proj_years, shares, net_debt)
-                        col_vals.append(f"${iv:.0f}" if iv else "N/A")
-                    sens[f"WACC {dr*100:.1f}%"] = col_vals
-
-                sens_df = pd.DataFrame(sens, index=[f"Growth {g*100:.0f}%" for g in g_range])
-                st.dataframe(sens_df, use_container_width=True)
-                st.caption("Rows = FCF growth rate assumption | Columns = discount rate (WACC)")
-
-    # -----------------------------------------------------------------------
-    # Peer Comparison
-    # -----------------------------------------------------------------------
-    with tab7:
-        st.subheader("👥 Peer Comparison")
-
-        # yfinance provides recommended peers in some tickers
-        peers_raw = []
-        try:
-            recs = data.get("recommendations")
-            # Try getting industry peers from info
-            pass
-        except Exception:
-            pass
-
-        # Let user input peers (yfinance doesn't auto-provide peer lists)
-        default_peers = ", ".join({
-            "AAPL": "MSFT, GOOGL, META, AMZN",
-            "TSLA": "F, GM, RIVN, NIO",
-            "MSFT": "AAPL, GOOGL, AMZN, CRM",
-            "AMZN": "MSFT, GOOGL, BABA, WMT",
-            "GOOGL": "MSFT, META, AMZN, AAPL",
-            "META":  "GOOGL, SNAP, PINS, TWTR",
-            "NVDA":  "AMD, INTC, QCOM, TSM",
-            "JPM":   "BAC, GS, MS, WFC",
-            "JNJ":   "PFE, MRK, ABT, UNH",
-            "XOM":   "CVX, BP, SHEL, COP",
-        }.get(symbol, ""))
-
-        peer_input = st.text_input(
-            "Enter peer tickers (comma-separated)",
-            value=default_peers,
-            help="Type the ticker symbols of competitors you want to compare against"
-        )
-        run_peers = st.button("Compare Peers", type="secondary")
-
-        if run_peers and peer_input:
-            peers = [p.strip().upper() for p in peer_input.split(",") if p.strip()][:6]
-
-            with st.spinner(f"Fetching data for {', '.join(peers)}..."):
-                peer_infos = {symbol: info}
-                for p in peers:
-                    peer_infos[p] = fetch_peer(p)
-
-            # Comparison table
-            rows = []
-            for ticker, inf in peer_infos.items():
-                if not inf: continue
-                row = {
-                    "Ticker": ticker,
-                    "Name":   (inf.get("longName") or ticker)[:22],
-                    "Mkt Cap": fmt_money(inf.get("marketCap")),
-                }
-                for label, (key, is_pct) in PEER_KEYS.items():
-                    v = sg(inf, key)
-                    row[label] = (fmt_pct(v) if is_pct else fmt_num(v)) if v is not None else "N/A"
-                rows.append(row)
-
-            comp_df = pd.DataFrame(rows).set_index("Ticker")
-            st.dataframe(comp_df, use_container_width=True)
-
-            # Bar charts
-            st.markdown("**Visual Comparison**")
-            chart_cols = st.columns(2)
-            chart_metrics = ["P/E", "EV/EBITDA", "Net Margin", "ROE"]
-
-            for i, metric in enumerate(chart_metrics):
-                key, is_pct = PEER_KEYS[metric]
-                chart_data = []
-                for ticker, inf in peer_infos.items():
-                    v = sg(inf, key)
-                    if v is not None and isinstance(v, (int, float)) and not np.isnan(v):
-                        chart_data.append({"Ticker": ticker, "Value": v * 100 if is_pct else v})
-
-                if chart_data:
-                    cdf = pd.DataFrame(chart_data).sort_values("Value")
-                    bar_colors = ["#e74c3c" if r == symbol else "#3498db" for r in cdf["Ticker"]]
-                    fig = go.Figure(go.Bar(x=cdf["Ticker"], y=cdf["Value"], marker_color=bar_colors))
-                    fig.update_layout(
-                        title=f"{metric}{' (%)' if is_pct else ''}  — red = {symbol}",
-                        height=280, showlegend=False,
-                        margin=dict(l=10, r=10, t=40, b=10)
-                    )
-                    chart_cols[i % 2].plotly_chart(fig, use_container_width=True)
-
-            # Percentile ranking
-            st.markdown(f"**{symbol} Percentile Ranking vs Peers**")
-            pct_rows = []
-            for label, (key, is_pct) in PEER_KEYS.items():
-                vals = {}
-                for ticker, inf in peer_infos.items():
-                    v = sg(inf, key)
-                    if v is not None and isinstance(v, (int, float)) and not np.isnan(v):
-                        vals[ticker] = v
-
-                if symbol in vals and len(vals) > 1:
-                    main_val = vals[symbol]
-                    sorted_vals = sorted(vals.values())
-                    rank = sorted_vals.index(main_val) + 1
-                    n    = len(sorted_vals)
-                    # Higher is better for margins/returns; lower is better for valuation ratios
-                    pct_rank = (rank / n * 100) if is_pct else ((n - rank + 1) / n * 100)
-                    interp = ("✅ Better than most peers" if pct_rank >= 60
-                              else "⚠️ Middle of the pack" if pct_rank >= 40
-                              else "🔴 Lags most peers")
-                    pct_rows.append({
-                        "Metric":              label,
-                        f"{symbol} Value":     fmt_pct(main_val) if is_pct else fmt_num(main_val),
-                        "Percentile":          f"{pct_rank:.0f}th",
-                        "Interpretation":      interp,
-                    })
-
-            if pct_rows:
-                st.dataframe(pd.DataFrame(pct_rows), hide_index=True, use_container_width=True)
-        else:
-            st.info("Enter peer tickers above and click **Compare Peers** to run the comparison.")
-
-else:
+# Only render results if we have data stored
+if "data" not in st.session_state:
     st.info("Enter a ticker symbol above and click **Analyze** to get started.")
+    st.stop()
+
+data    = st.session_state["data"]
+symbol  = st.session_state["last_symbol"]
+info    = data["info"]
+hist    = data["hist"]
+inc     = data["income_stmt"]
+bal     = data["balance_sheet"]
+cf_stmt = data["cashflow"]
+
+# --- Header ---
+name  = info.get("longName", symbol)
+price = sg(info, "currentPrice", "regularMarketPrice")
+st.header(f"{name} ({symbol})")
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("Price",      f"${price}" if price else "N/A")
+c2.metric("Market Cap", fmt_money(info.get("marketCap")))
+c3.metric("Sector",     info.get("sector", "N/A"))
+c4.metric("Industry",   info.get("industry", "N/A"))
+
+# --- Compute metrics ---
+val  = compute_valuation(info)
+grw  = compute_growth(info, inc)
+prof = compute_profitability(info)
+hlth = compute_health(info)
+fut  = compute_future(info)
+tech = compute_technicals(hist)
+
+cat_scores = {
+    "Valuation":      score_val(val),
+    "Growth":         score_growth(grw),
+    "Profitability":  score_profit(prof),
+    "Future Outlook": score_future(fut),
+    "Technicals":     score_tech(tech),
+}
+total, verd, color = get_verdict(cat_scores)
+
+# --- Verdict banner ---
+st.markdown("---")
+v1, v2 = st.columns([1, 2])
+with v1:
+    st.markdown(f"### Verdict: :{color}[{verd}]")
+    st.markdown(f"**Composite Score:** {total:+.2f}  (−1 undervalued → +1 overvalued)")
+with v2:
+    st.dataframe(pd.DataFrame({
+        "Category": list(cat_scores.keys()),
+        "Score":    [f"{v:+.2f}" for v in cat_scores.values()],
+        "Weight":   [f"{WEIGHTS[c]:.0%}" for c in cat_scores],
+    }), hide_index=True, use_container_width=True)
+st.caption("Heuristic screen only — not investment advice.")
+
+# --- Price chart ---
+st.markdown("---")
+st.subheader("Price Chart (2Y)")
+if not hist.empty:
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=hist.index, y=hist["Close"], name="Close", line=dict(color="#1f77b4")))
+    if len(hist) >= 50:
+        fig.add_trace(go.Scatter(x=hist.index, y=hist["Close"].rolling(50).mean(),
+                                 name="50-Day MA", line=dict(color="orange", dash="dot")))
+    if len(hist) >= 200:
+        fig.add_trace(go.Scatter(x=hist.index, y=hist["Close"].rolling(200).mean(),
+                                 name="200-Day MA", line=dict(color="red", dash="dot")))
+    fig.update_layout(height=380, margin=dict(l=10, r=10, t=10, b=10))
+    st.plotly_chart(fig, use_container_width=True)
+
+# -----------------------------------------------------------------------
+# Tabs
+# -----------------------------------------------------------------------
+st.markdown("---")
+tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+    "Valuation", "Growth", "Profitability & Health",
+    "Future Outlook", "Technicals",
+    "📐 DCF Calculator", "👥 Peer Comparison"
+])
+
+PCT_GRW  = ["Revenue Growth (YoY)", "Earnings Growth (YoY)",
+            "Quarterly Earnings Growth (YoY)", "Revenue 3-4Y CAGR", "Net Income 3-4Y CAGR"]
+PCT_PROF = ["Gross Margin", "Operating Margin", "Net Margin", "ROE", "ROA"]
+PCT_FUT  = ["Implied Upside"]
+PCT_TECH = ["% From 52W High", "% From 52W Low"]
+MON_FUT  = ["Current Price", "Analyst Target Mean", "Analyst Target High", "Analyst Target Low"]
+MON_TECH = ["Current Price", "50-Day MA", "200-Day MA", "52-Week High", "52-Week Low"]
+
+with tab1: show_table(val)
+with tab2: show_table(grw, pct_keys=PCT_GRW)
+with tab3:
+    st.markdown("**Profitability**")
+    show_table(prof, pct_keys=PCT_PROF)
+    st.markdown("**Financial Health**")
+    show_table(hlth, money_keys=["Free Cash Flow"])
+with tab4: show_table(fut, pct_keys=PCT_FUT, money_keys=MON_FUT)
+with tab5: show_table(tech, pct_keys=PCT_TECH, money_keys=MON_TECH)
+
+# -----------------------------------------------------------------------
+# DCF Calculator
+# -----------------------------------------------------------------------
+with tab6:
+    st.subheader("📐 DCF Intrinsic Value Calculator")
+    st.caption("Adjust the sliders. The model projects free cash flows and discounts them back to today.")
+
+    try:
+        base_fcf = cf_stmt.loc["Free Cash Flow"].iloc[0] if cf_stmt is not None and not cf_stmt.empty else None
+    except Exception:
+        base_fcf = sg(info, "freeCashflow")
+    try:
+        base_rev = inc.loc["Total Revenue"].iloc[0] if inc is not None and not inc.empty else None
+    except Exception:
+        base_rev = sg(info, "totalRevenue")
+
+    shares = sg(info, "sharesOutstanding", "impliedSharesOutstanding")
+    try:
+        total_debt = bal.loc["Total Debt"].iloc[0] if bal is not None and not bal.empty else 0
+    except Exception:
+        total_debt = 0
+    try:
+        cash_val = bal.loc["Cash And Cash Equivalents"].iloc[0] if bal is not None and not bal.empty else 0
+    except Exception:
+        cash_val = sg(info, "totalCash", default=0)
+
+    net_debt  = (total_debt or 0) - (cash_val or 0)
+    cur_price = sg(info, "currentPrice", "regularMarketPrice")
+
+    st.markdown("**Company Financials (auto-filled from latest filings)**")
+    d1, d2, d3, d4 = st.columns(4)
+    d1.metric("Latest FCF",     fmt_money(base_fcf))
+    d2.metric("Latest Revenue", fmt_money(base_rev))
+    d3.metric("Net Debt",       fmt_money(net_debt))
+    d4.metric("Shares Out.",    fmt_money(shares))
+
+    st.markdown("**Your Assumptions**")
+    a1, a2, a3, a4 = st.columns(4)
+    growth_rate     = a1.slider("FCF Growth Rate",      0, 40, 10, 1, format="%d%%", key="dcf_growth")     / 100
+    terminal_growth = a2.slider("Terminal Growth Rate", 0,  5,  2, 1, format="%d%%", key="dcf_terminal")   / 100
+    discount_rate   = a3.slider("Discount Rate (WACC)", 5, 20, 10, 1, format="%d%%", key="dcf_discount")   / 100
+    proj_years      = a4.slider("Projection Years",     5, 15, 10,                   key="dcf_years")
+
+    if discount_rate <= terminal_growth:
+        st.error("Discount rate must be greater than terminal growth rate.")
+    else:
+        intrinsic, cf_rows, tv_pv = run_dcf(
+            base_fcf, base_rev, growth_rate, terminal_growth,
+            discount_rate, proj_years, shares, net_debt
+        )
+        if intrinsic is None:
+            st.warning("Not enough data to run DCF — missing FCF or share count.")
+        else:
+            mos = (intrinsic - cur_price) / intrinsic if cur_price else None
+            r1, r2, r3 = st.columns(3)
+            r1.metric("Intrinsic Value / Share", f"${intrinsic:.2f}")
+            r2.metric("Current Price", f"${cur_price:.2f}" if cur_price else "N/A")
+            if mos is not None:
+                lbl = "Upside" if mos > 0 else "Downside"
+                tag = "Undervalued" if mos > 0 else "Overvalued"
+                r3.metric(lbl, f"{mos * 100:.1f}%", delta=tag,
+                          delta_color="normal" if mos > 0 else "inverse")
+
+            st.markdown("**Present Value Breakdown**")
+            df_cf = pd.DataFrame(cf_rows)
+            fig_d = go.Figure(go.Bar(
+                x=df_cf["Year"].tolist() + ["Terminal Value"],
+                y=df_cf["PV ($M)"].tolist() + [tv_pv],
+                marker_color=["#1f77b4"] * len(df_cf) + ["#ff7f0e"]
+            ))
+            fig_d.update_layout(title="PV of Projected FCFs + Terminal Value ($M)",
+                                height=340, margin=dict(l=10, r=10, t=40, b=10))
+            st.plotly_chart(fig_d, use_container_width=True)
+
+            st.markdown("**Sensitivity Table — Intrinsic Value / Share**")
+            g_range = [round(growth_rate + d, 2) for d in [-0.04, -0.02, 0, 0.02, 0.04]]
+            d_range = [round(discount_rate + d, 3) for d in [-0.02, -0.01, 0, 0.01, 0.02]]
+            d_valid = [d for d in d_range if d > terminal_growth and d > 0]
+            sens = {}
+            for dr in d_valid:
+                col_vals = []
+                for gr in g_range:
+                    iv, _, _ = run_dcf(base_fcf, base_rev, gr, terminal_growth, dr, proj_years, shares, net_debt)
+                    col_vals.append(f"${iv:.0f}" if iv else "N/A")
+                sens[f"WACC {dr*100:.1f}%"] = col_vals
+            sens_df = pd.DataFrame(sens, index=[f"Growth {g*100:.0f}%" for g in g_range])
+            st.dataframe(sens_df, use_container_width=True)
+            st.caption("Rows = FCF growth rate | Columns = discount rate (WACC)")
+
+# -----------------------------------------------------------------------
+# Peer Comparison
+# -----------------------------------------------------------------------
+with tab7:
+    st.subheader("👥 Peer Comparison")
+
+    DEFAULT_PEERS = {
+        "AAPL": "MSFT, GOOGL, META, AMZN",
+        "TSLA": "F, GM, RIVN, NIO",
+        "MSFT": "AAPL, GOOGL, AMZN, CRM",
+        "AMZN": "MSFT, GOOGL, BABA, WMT",
+        "GOOGL": "MSFT, META, AMZN, AAPL",
+        "META":  "GOOGL, SNAP, PINS, TWTR",
+        "NVDA":  "AMD, INTC, QCOM, TSM",
+        "JPM":   "BAC, GS, MS, WFC",
+        "JNJ":   "PFE, MRK, ABT, UNH",
+        "XOM":   "CVX, BP, SHEL, COP",
+    }
+
+    peer_input = st.text_input(
+        "Enter peer tickers (comma-separated)",
+        value=DEFAULT_PEERS.get(symbol, ""),
+        key="peer_input",
+        help="Type competitor ticker symbols, e.g. MSFT, GOOGL, META"
+    )
+    run_peers = st.button("Compare Peers", type="secondary", key="btn_peers")
+
+    # Fetch peers and store in session_state so the comparison
+    # survives subsequent widget interactions without re-fetching
+    if run_peers and peer_input:
+        peers = [p.strip().upper() for p in peer_input.split(",") if p.strip()][:6]
+        with st.spinner(f"Fetching data for {', '.join(peers)}..."):
+            peer_infos = {symbol: info}
+            for p in peers:
+                peer_infos[p] = fetch_peer(p)
+        st.session_state["peer_infos"] = peer_infos
+
+    peer_infos = st.session_state.get("peer_infos")
+
+    if peer_infos:
+        # Comparison table
+        rows = []
+        for ticker, inf in peer_infos.items():
+            if not inf: continue
+            row = {
+                "Ticker":  ticker,
+                "Name":    (inf.get("longName") or ticker)[:22],
+                "Mkt Cap": fmt_money(inf.get("marketCap")),
+            }
+            for label, (key, is_pct) in PEER_KEYS.items():
+                v = sg(inf, key)
+                row[label] = (fmt_pct(v) if is_pct else fmt_num(v)) if v is not None else "N/A"
+            rows.append(row)
+
+        comp_df = pd.DataFrame(rows).set_index("Ticker")
+        st.dataframe(comp_df, use_container_width=True)
+
+        # Bar charts
+        st.markdown("**Visual Comparison**")
+        chart_cols   = st.columns(2)
+        chart_metrics = ["P/E", "EV/EBITDA", "Net Margin", "ROE"]
+        for i, metric in enumerate(chart_metrics):
+            key, is_pct = PEER_KEYS[metric]
+            chart_data = []
+            for ticker, inf in peer_infos.items():
+                v = sg(inf, key)
+                if v is not None and isinstance(v, (int, float)) and not np.isnan(v):
+                    chart_data.append({"Ticker": ticker, "Value": v * 100 if is_pct else v})
+            if chart_data:
+                cdf = pd.DataFrame(chart_data).sort_values("Value")
+                bar_colors = ["#e74c3c" if t == symbol else "#3498db" for t in cdf["Ticker"]]
+                fig_p = go.Figure(go.Bar(x=cdf["Ticker"], y=cdf["Value"], marker_color=bar_colors))
+                fig_p.update_layout(
+                    title=f"{metric}{' (%)' if is_pct else ''}  — red = {symbol}",
+                    height=280, showlegend=False,
+                    margin=dict(l=10, r=10, t=40, b=10)
+                )
+                chart_cols[i % 2].plotly_chart(fig_p, use_container_width=True)
+
+        # Percentile ranking
+        st.markdown(f"**{symbol} Percentile Ranking vs Peers**")
+        pct_rows = []
+        for label, (key, is_pct) in PEER_KEYS.items():
+            vals = {}
+            for ticker, inf in peer_infos.items():
+                v = sg(inf, key)
+                if v is not None and isinstance(v, (int, float)) and not np.isnan(v):
+                    vals[ticker] = v
+            if symbol in vals and len(vals) > 1:
+                main_val    = vals[symbol]
+                sorted_vals = sorted(vals.values())
+                rank        = sorted_vals.index(main_val) + 1
+                n           = len(sorted_vals)
+                pct_rank    = (rank / n * 100) if is_pct else ((n - rank + 1) / n * 100)
+                interp = ("✅ Better than most peers" if pct_rank >= 60
+                          else "⚠️ Middle of the pack" if pct_rank >= 40
+                          else "🔴 Lags most peers")
+                pct_rows.append({
+                    "Metric":          label,
+                    f"{symbol} Value": fmt_pct(main_val) if is_pct else fmt_num(main_val),
+                    "Percentile":      f"{pct_rank:.0f}th",
+                    "Interpretation":  interp,
+                })
+        if pct_rows:
+            st.dataframe(pd.DataFrame(pct_rows), hide_index=True, use_container_width=True)
+    else:
+        st.info("Enter peer tickers above and click **Compare Peers** to run the comparison.")
