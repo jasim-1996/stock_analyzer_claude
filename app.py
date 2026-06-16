@@ -2,13 +2,21 @@
 Stock Analyzer - Web App (Streamlit)
 
 Run locally:
-    pip install streamlit yfinance pandas numpy ta plotly requests requests-cache
+    pip install streamlit yfinance pandas numpy ta plotly requests redis
     streamlit run app.py
+    No secrets needed locally — runs without Redis cache.
 
-Deploy on Streamlit Cloud:
-    Push app.py + requirements.txt to GitHub, connect at share.streamlit.io
+Deploy on Streamlit Cloud (to fix Yahoo Finance rate limiting):
+    1. Create a free Redis at https://upstash.com (free tier: 500K cmds/month)
+    2. In Streamlit Cloud app Settings > Secrets, add:
+           REDIS_URL = "rediss://:<password>@<host>:<port>"
+       (copy the "Redis URL" from Upstash console)
+    3. Push app.py + requirements.txt to GitHub and deploy.
 """
 
+import json
+import hashlib
+import time
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -16,36 +24,99 @@ import yfinance as yf
 import ta
 import plotly.graph_objects as go
 import plotly.express as px
-import requests
-import requests_cache
 
 # ---------------------------------------------------------------------------
-# Rate-limit fix: cache all yfinance HTTP requests to disk for 24 hours.
-# Yahoo Finance is only hit once per ticker per day — every repeat lookup
-# is served from the local SQLite cache instantly (no 429 errors).
+# Redis cache — persists across Streamlit Cloud reruns/redeploys.
+# Falls back to no cache when Redis isn't configured (local dev).
 # ---------------------------------------------------------------------------
-requests_cache.install_cache(
-    cache_name="yf_cache",
-    backend="sqlite",
-    expire_after=86400,   # 24 hours
-    allowable_codes=[200],
-)
+
+def get_redis():
+    try:
+        import redis
+        url = st.secrets.get("REDIS_URL", "")
+        if not url:
+            return None
+        r = redis.from_url(url, decode_responses=True, socket_timeout=5)
+        r.ping()
+        return r
+    except Exception:
+        return None
+
+REDIS = get_redis()
+CACHE_TTL = 86400  # 24 hours
+
+def cache_get(key):
+    if REDIS:
+        try:
+            val = REDIS.get(key)
+            return json.loads(val) if val else None
+        except Exception:
+            return None
+    return None
+
+def cache_set(key, value):
+    if REDIS:
+        try:
+            REDIS.setex(key, CACHE_TTL, json.dumps(value, default=str))
+        except Exception:
+            pass
+
+def yf_fetch(symbol):
+    """Fetch yfinance data with Redis cache layer."""
+    key = f"yf:{symbol}"
+    cached = cache_get(key)
+    if cached:
+        return cached
+
+    t = yf.Ticker(symbol)
+    info = t.info
+    if not info or (info.get("regularMarketPrice") is None and info.get("currentPrice") is None):
+        raise ValueError(f"No data found for '{symbol}'. Check the ticker.")
+
+    hist        = t.history(period="2y")
+    income_stmt = t.income_stmt
+    balance     = t.balance_sheet
+    cashflow    = t.cashflow
+
+    # Serialize DataFrames to JSON-safe dicts
+    def df_to_dict(df):
+        if df is None or (hasattr(df, "empty") and df.empty):
+            return None
+        return df.reset_index().to_dict(orient="list")
+
+    result = {
+        "info":         info,
+        "hist":         df_to_dict(hist),
+        "income_stmt":  df_to_dict(income_stmt),
+        "balance_sheet":df_to_dict(balance),
+        "cashflow":     df_to_dict(cashflow),
+    }
+    cache_set(key, result)
+    return result
+
+def dict_to_df(d):
+    if d is None:
+        return pd.DataFrame()
+    df = pd.DataFrame(d)
+    # Restore index if it was a date/string column
+    if "index" in df.columns:
+        df = df.set_index("index")
+    elif "Date" in df.columns:
+        df = df.set_index("Date")
+        df.index = pd.to_datetime(df.index)
+    return df
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_all(symbol):
     try:
-        t = yf.Ticker(symbol)
-        info = t.info
-        if not info or (info.get("regularMarketPrice") is None and info.get("currentPrice") is None):
-            return {"error": f"No data found for '{symbol}'. Check the ticker."}
+        raw = yf_fetch(symbol)
         return {
-            "info":             info,
-            "hist":             t.history(period="2y"),
-            "income_stmt":      t.income_stmt,
-            "quarterly_income": t.quarterly_income_stmt,
-            "balance_sheet":    t.balance_sheet,
-            "cashflow":         t.cashflow,
-            "recommendations":  t.recommendations,
+            "info":         raw["info"],
+            "hist":         dict_to_df(raw["hist"]),
+            "income_stmt":  dict_to_df(raw["income_stmt"]),
+            "balance_sheet":dict_to_df(raw["balance_sheet"]),
+            "cashflow":     dict_to_df(raw["cashflow"]),
+            "recommendations": None,
         }
     except Exception as e:
         return {"error": str(e)}
@@ -53,8 +124,8 @@ def fetch_all(symbol):
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_peer(ticker):
     try:
-        t = yf.Ticker(ticker)
-        return t.info or {}
+        raw = yf_fetch(ticker)
+        return raw["info"] or {}
     except Exception:
         return {}
 
