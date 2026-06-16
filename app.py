@@ -2,13 +2,12 @@
 Stock Analyzer - Web App (Streamlit)
 
 Run locally:
-    pip install streamlit yfinance pandas numpy ta plotly
+    pip install streamlit yfinance pandas numpy ta plotly requests
     streamlit run app.py
 
-Deploy free:
-    1. Push this file + requirements.txt to a GitHub repo
-    2. Go to https://share.streamlit.io
-    3. Connect your repo and deploy
+Deploy on Streamlit Cloud:
+    Push app.py + requirements.txt to GitHub, connect at share.streamlit.io
+    The yfinance rate-limit fix (fake browser session) is built in.
 """
 
 import numpy as np
@@ -17,403 +16,616 @@ import streamlit as st
 import yfinance as yf
 import ta
 import plotly.graph_objects as go
-
-
-# ---------------------------------------------------------------------------
-# Data fetching (cached so repeated lookups are fast)
-# ---------------------------------------------------------------------------
-
-@st.cache_data(ttl=3600)
-def get_ticker_data(symbol):
-    t = yf.Ticker(symbol)
-    info = t.info
-    if not info or (info.get("regularMarketPrice") is None and info.get("currentPrice") is None):
-        return None
-
-    hist = t.history(period="2y")
-    income_stmt = t.income_stmt
-    quarterly_income = t.quarterly_income_stmt
-    balance_sheet = t.balance_sheet
-    cashflow = t.cashflow
-
-    return {
-        "info": info,
-        "hist": hist,
-        "income_stmt": income_stmt,
-        "quarterly_income": quarterly_income,
-        "balance_sheet": balance_sheet,
-        "cashflow": cashflow,
-    }
-
+import plotly.express as px
+import requests
 
 # ---------------------------------------------------------------------------
-# Helper utilities
+# yfinance rate-limit fix: use a real browser session so Streamlit Cloud
+# doesn't get blocked by Yahoo Finance
 # ---------------------------------------------------------------------------
 
-def safe_get(d, key, default=None):
-    val = d.get(key, default)
-    if val is None:
-        return default
-    return val
+def make_yf_session():
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
+    })
+    return session
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_all(symbol):
+    try:
+        session = make_yf_session()
+        t = yf.Ticker(symbol, session=session)
+        info = t.info
+        if not info or (info.get("regularMarketPrice") is None and info.get("currentPrice") is None):
+            return {"error": f"No data found for '{symbol}'. Check the ticker."}
+        return {
+            "info":             info,
+            "hist":             t.history(period="2y"),
+            "income_stmt":      t.income_stmt,
+            "quarterly_income": t.quarterly_income_stmt,
+            "balance_sheet":    t.balance_sheet,
+            "cashflow":         t.cashflow,
+            "recommendations":  t.recommendations,
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_peer(ticker):
+    try:
+        session = make_yf_session()
+        t = yf.Ticker(ticker, session=session)
+        return t.info or {}
+    except Exception:
+        return {}
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def sg(d, *keys, default=None):
+    for k in keys:
+        v = d.get(k) if isinstance(d, dict) else None
+        if v is not None and not (isinstance(v, float) and np.isnan(v)):
+            return v
+    return default
 
 def fmt_pct(x):
-    if x is None or (isinstance(x, float) and np.isnan(x)):
-        return "N/A"
+    if x is None or (isinstance(x, float) and np.isnan(x)): return "N/A"
     return f"{x * 100:.2f}%"
 
-
 def fmt_num(x, dec=2):
-    if x is None or (isinstance(x, float) and np.isnan(x)):
-        return "N/A"
+    if x is None or (isinstance(x, float) and np.isnan(x)): return "N/A"
     return f"{x:.{dec}f}"
 
-
 def fmt_money(x):
-    if x is None or (isinstance(x, float) and np.isnan(x)):
-        return "N/A"
-    abs_x = abs(x)
-    if abs_x >= 1e12:
-        return f"${x/1e12:.2f}T"
-    if abs_x >= 1e9:
-        return f"${x/1e9:.2f}B"
-    if abs_x >= 1e6:
-        return f"${x/1e6:.2f}M"
+    if x is None or (isinstance(x, float) and np.isnan(x)): return "N/A"
+    ax = abs(x)
+    if ax >= 1e12: return f"${x/1e12:.2f}T"
+    if ax >= 1e9:  return f"${x/1e9:.2f}B"
+    if ax >= 1e6:  return f"${x/1e6:.2f}M"
     return f"${x:,.0f}"
 
+def show_table(metrics, pct_keys=None, money_keys=None):
+    pct_keys, money_keys = pct_keys or [], money_keys or []
+    rows = []
+    for k, v in metrics.items():
+        if   k in pct_keys:   display = fmt_pct(v)
+        elif k in money_keys: display = fmt_money(v)
+        elif isinstance(v, float): display = fmt_num(v)
+        else: display = str(v) if v is not None else "N/A"
+        rows.append({"Metric": k, "Value": display})
+    st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
 
 def cagr(series):
     series = series.dropna()
-    if len(series) < 2:
-        return None
+    if len(series) < 2: return None
     vals = series.values[::-1]
-    start, end = vals[0], vals[-1]
-    years = len(vals) - 1
-    if start <= 0 or end <= 0 or years <= 0:
-        return None
-    return (end / start) ** (1 / years) - 1
-
+    s, e = vals[0], vals[-1]
+    n = len(vals) - 1
+    if s <= 0 or e <= 0 or n <= 0: return None
+    return (e / s) ** (1 / n) - 1
 
 # ---------------------------------------------------------------------------
 # Metric computation
 # ---------------------------------------------------------------------------
 
-def compute_valuation_metrics(info):
+def compute_valuation(info):
     return {
-        "Trailing P/E": safe_get(info, "trailingPE"),
-        "Forward P/E": safe_get(info, "forwardPE"),
-        "PEG Ratio": safe_get(info, "pegRatio") or safe_get(info, "trailingPegRatio"),
-        "Price/Book": safe_get(info, "priceToBook"),
-        "Price/Sales": safe_get(info, "priceToSalesTrailing12Months"),
-        "EV/EBITDA": safe_get(info, "enterpriseToEbitda"),
-        "EV/Revenue": safe_get(info, "enterpriseToRevenue"),
+        "Trailing P/E":  sg(info, "trailingPE"),
+        "Forward P/E":   sg(info, "forwardPE"),
+        "PEG Ratio":     sg(info, "pegRatio", "trailingPegRatio"),
+        "Price/Book":    sg(info, "priceToBook"),
+        "Price/Sales":   sg(info, "priceToSalesTrailing12Months"),
+        "EV/EBITDA":     sg(info, "enterpriseToEbitda"),
+        "EV/Revenue":    sg(info, "enterpriseToRevenue"),
     }
 
-
-def compute_growth_metrics(info, income_stmt):
-    metrics = {
-        "Revenue Growth (YoY)": safe_get(info, "revenueGrowth"),
-        "Earnings Growth (YoY)": safe_get(info, "earningsGrowth"),
-        "Quarterly Earnings Growth (YoY)": safe_get(info, "earningsQuarterlyGrowth"),
+def compute_growth(info, income_stmt):
+    m = {
+        "Revenue Growth (YoY)":            sg(info, "revenueGrowth"),
+        "Earnings Growth (YoY)":           sg(info, "earningsGrowth"),
+        "Quarterly Earnings Growth (YoY)": sg(info, "earningsQuarterlyGrowth"),
     }
     try:
         rev = income_stmt.loc["Total Revenue"]
-        metrics["Revenue 3-4Y CAGR"] = cagr(rev)
-    except Exception:
-        metrics["Revenue 3-4Y CAGR"] = None
+        m["Revenue 3-4Y CAGR"] = cagr(rev)
+    except Exception: m["Revenue 3-4Y CAGR"] = None
     try:
         ni = income_stmt.loc["Net Income"]
-        metrics["Net Income 3-4Y CAGR"] = cagr(ni)
-    except Exception:
-        metrics["Net Income 3-4Y CAGR"] = None
-    return metrics
+        m["Net Income 3-4Y CAGR"] = cagr(ni)
+    except Exception: m["Net Income 3-4Y CAGR"] = None
+    return m
 
-
-def compute_profitability_metrics(info):
+def compute_profitability(info):
     return {
-        "Gross Margin": safe_get(info, "grossMargins"),
-        "Operating Margin": safe_get(info, "operatingMargins"),
-        "Net Margin": safe_get(info, "profitMargins"),
-        "ROE": safe_get(info, "returnOnEquity"),
-        "ROA": safe_get(info, "returnOnAssets"),
+        "Gross Margin":    sg(info, "grossMargins"),
+        "Operating Margin":sg(info, "operatingMargins"),
+        "Net Margin":      sg(info, "profitMargins"),
+        "ROE":             sg(info, "returnOnEquity"),
+        "ROA":             sg(info, "returnOnAssets"),
     }
 
-
-def compute_financial_health_metrics(info):
+def compute_health(info):
     return {
-        "Debt/Equity": safe_get(info, "debtToEquity"),
-        "Current Ratio": safe_get(info, "currentRatio"),
-        "Quick Ratio": safe_get(info, "quickRatio"),
-        "Free Cash Flow": safe_get(info, "freeCashflow"),
+        "Debt/Equity":   sg(info, "debtToEquity"),
+        "Current Ratio": sg(info, "currentRatio"),
+        "Quick Ratio":   sg(info, "quickRatio"),
+        "Free Cash Flow":sg(info, "freeCashflow"),
     }
 
-
-def compute_future_expectations(info):
-    current_price = safe_get(info, "currentPrice") or safe_get(info, "regularMarketPrice")
-    target_mean = safe_get(info, "targetMeanPrice")
-    upside = None
-    if current_price and target_mean:
-        upside = (target_mean - current_price) / current_price
+def compute_future(info):
+    price  = sg(info, "currentPrice", "regularMarketPrice")
+    target = sg(info, "targetMeanPrice")
+    upside = (target - price) / price if price and target else None
     return {
-        "Current Price": current_price,
-        "Analyst Target Mean": target_mean,
-        "Analyst Target High": safe_get(info, "targetHighPrice"),
-        "Analyst Target Low": safe_get(info, "targetLowPrice"),
-        "Implied Upside": upside,
-        "Recommendation": safe_get(info, "recommendationKey"),
-        "Number of Analyst Opinions": safe_get(info, "numberOfAnalystOpinions"),
-        "Forward EPS": safe_get(info, "forwardEps"),
-        "Trailing EPS": safe_get(info, "trailingEps"),
+        "Current Price":          price,
+        "Analyst Target Mean":    target,
+        "Analyst Target High":    sg(info, "targetHighPrice"),
+        "Analyst Target Low":     sg(info, "targetLowPrice"),
+        "Implied Upside":         upside,
+        "Recommendation":         sg(info, "recommendationKey"),
+        "# Analyst Opinions":     sg(info, "numberOfAnalystOpinions"),
+        "Forward EPS":            sg(info, "forwardEps"),
+        "Trailing EPS":           sg(info, "trailingEps"),
     }
 
-
-def compute_technical_metrics(hist):
-    if hist.empty:
-        return {}
-    close = hist["Close"]
+def compute_technicals(hist):
+    if hist is None or hist.empty: return {}
+    close   = hist["Close"]
     current = close.iloc[-1]
-
-    ma50 = close.rolling(50).mean().iloc[-1] if len(close) >= 50 else None
-    ma200 = close.rolling(200).mean().iloc[-1] if len(close) >= 200 else None
-
-    rsi_series = ta.momentum.RSIIndicator(close, window=14).rsi()
-    rsi = rsi_series.iloc[-1] if not rsi_series.empty else None
-
-    macd_obj = ta.trend.MACD(close)
-    macd_line = macd_obj.macd().iloc[-1]
-    macd_signal = macd_obj.macd_signal().iloc[-1]
-
-    high_52w = close[-252:].max()
-    low_52w = close[-252:].min()
-
+    ma50    = close.rolling(50).mean().iloc[-1]  if len(close) >= 50  else None
+    ma200   = close.rolling(200).mean().iloc[-1] if len(close) >= 200 else None
+    rsi     = ta.momentum.RSIIndicator(close, 14).rsi().iloc[-1] if len(close) > 14 else None
+    macd_o  = ta.trend.MACD(close)
+    macd    = macd_o.macd().iloc[-1]
+    msig    = macd_o.macd_signal().iloc[-1]
+    h52, l52 = close[-252:].max(), close[-252:].min()
     return {
-        "Current Price": current,
-        "50-Day MA": ma50,
-        "200-Day MA": ma200,
-        "RSI (14)": rsi,
-        "MACD": macd_line,
-        "MACD Signal": macd_signal,
-        "52-Week High": high_52w,
-        "52-Week Low": low_52w,
-        "% From 52W High": (current - high_52w) / high_52w,
-        "% From 52W Low": (current - low_52w) / low_52w,
+        "Current Price":   current,
+        "50-Day MA":       ma50,
+        "200-Day MA":      ma200,
+        "RSI (14)":        rsi,
+        "MACD":            macd,
+        "MACD Signal":     msig,
+        "52-Week High":    h52,
+        "52-Week Low":     l52,
+        "% From 52W High": (current - h52) / h52 if h52 else None,
+        "% From 52W Low":  (current - l52) / l52 if l52 else None,
     }
 
+# ---------------------------------------------------------------------------
+# Scoring  (-1 = undervalued/bullish, +1 = overvalued/bearish)
+# ---------------------------------------------------------------------------
+
+def score_val(m):
+    s = []
+    pe = m.get("Trailing P/E")
+    if pe:  s.append(-1 if pe < 15 else (1 if pe > 30 else 0))
+    peg = m.get("PEG Ratio")
+    if peg: s.append(-1 if peg < 1 else (1 if peg > 2 else 0))
+    pb = m.get("Price/Book")
+    if pb:  s.append(-1 if pb < 1 else (1 if pb > 5 else 0))
+    ev = m.get("EV/EBITDA")
+    if ev:  s.append(-1 if ev < 8 else (1 if ev > 18 else 0))
+    return np.mean(s) if s else 0
+
+def score_growth(m):
+    s = []
+    for k, hi, lo in [("Revenue Growth (YoY)", 0.15, 0),
+                       ("Earnings Growth (YoY)", 0.15, 0),
+                       ("Revenue 3-4Y CAGR", 0.10, 0)]:
+        v = m.get(k)
+        if v is not None: s.append(-1 if v > hi else (1 if v < lo else 0))
+    return np.mean(s) if s else 0
+
+def score_profit(m):
+    s = []
+    nm = m.get("Net Margin")
+    if nm is not None: s.append(-1 if nm > 0.15 else (1 if nm < 0.05 else 0))
+    roe = m.get("ROE")
+    if roe is not None: s.append(-1 if roe > 0.15 else (1 if roe < 0.05 else 0))
+    return np.mean(s) if s else 0
+
+def score_future(m):
+    s = []
+    up = m.get("Implied Upside")
+    if up is not None: s.append(-1 if up > 0.10 else (1 if up < -0.05 else 0))
+    rec = str(m.get("Recommendation", "")).lower()
+    if rec in ("strong_buy", "buy"): s.append(-1)
+    elif rec in ("sell", "strong_sell"): s.append(1)
+    elif rec: s.append(0)
+    return np.mean(s) if s else 0
+
+def score_tech(m):
+    s = []
+    rsi = m.get("RSI (14)")
+    if rsi is not None: s.append(-1 if rsi < 30 else (1 if rsi > 70 else 0))
+    price, ma50, ma200 = m.get("Current Price"), m.get("50-Day MA"), m.get("200-Day MA")
+    if price and ma50:  s.append(-0.5 if price < ma50  else 0.5)
+    if price and ma200: s.append(-0.5 if price < ma200 else 0.5)
+    macd, msig = m.get("MACD"), m.get("MACD Signal")
+    if macd is not None and msig is not None:
+        s.append(-0.5 if macd > msig else 0.5)
+    return np.mean(s) if s else 0
+
+WEIGHTS = {"Valuation": 0.35, "Growth": 0.20, "Profitability": 0.15,
+           "Future Outlook": 0.15, "Technicals": 0.15}
+
+def get_verdict(scores):
+    total = sum(scores[c] * WEIGHTS[c] for c in WEIGHTS)
+    if   total <= -0.3: return total, "UNDERVALUED",   "green"
+    elif total >=  0.3: return total, "OVERVALUED",    "red"
+    else:               return total, "FAIRLY VALUED",  "orange"
 
 # ---------------------------------------------------------------------------
-# Scoring system (-1 = undervalued/bullish, +1 = overvalued/bearish)
+# DCF Calculator
 # ---------------------------------------------------------------------------
 
-def score_valuation(metrics):
-    scores = []
-    pe = metrics.get("Trailing P/E")
-    if pe:
-        scores.append(-1 if pe < 15 else (1 if pe > 30 else 0))
-    peg = metrics.get("PEG Ratio")
-    if peg:
-        scores.append(-1 if peg < 1 else (1 if peg > 2 else 0))
-    pb = metrics.get("Price/Book")
-    if pb:
-        scores.append(-1 if pb < 1 else (1 if pb > 5 else 0))
-    ev_ebitda = metrics.get("EV/EBITDA")
-    if ev_ebitda:
-        scores.append(-1 if ev_ebitda < 8 else (1 if ev_ebitda > 18 else 0))
-    return np.mean(scores) if scores else 0
+def run_dcf(fcf, revenue, growth_rate, terminal_growth, discount_rate, years, shares, net_debt):
+    base = fcf if (fcf and fcf > 0) else (revenue * 0.05 if revenue else None)
+    if not base or not shares or shares == 0: return None, None, None
 
+    cf_rows = []
+    for y in range(1, years + 1):
+        cf = base * ((1 + growth_rate) ** y)
+        pv = cf / ((1 + discount_rate) ** y)
+        cf_rows.append({"Year": f"Year {y}", "FCF ($M)": cf / 1e6, "PV ($M)": pv / 1e6})
 
-def score_growth(metrics):
-    scores = []
-    for key, hi, lo in [
-        ("Revenue Growth (YoY)", 0.15, 0),
-        ("Earnings Growth (YoY)", 0.15, 0),
-        ("Revenue 3-4Y CAGR", 0.10, 0),
-    ]:
-        v = metrics.get(key)
-        if v is not None:
-            scores.append(-1 if v > hi else (1 if v < lo else 0))
-    return np.mean(scores) if scores else 0
+    t_fcf = base * ((1 + growth_rate) ** years) * (1 + terminal_growth)
+    tv    = t_fcf / (discount_rate - terminal_growth)
+    tv_pv = tv / ((1 + discount_rate) ** years)
 
+    equity_val = (sum(r["PV ($M)"] for r in cf_rows) * 1e6 + tv_pv) - (net_debt or 0)
+    return equity_val / shares, cf_rows, tv_pv / 1e6
 
-def score_profitability(metrics):
-    scores = []
-    nm = metrics.get("Net Margin")
-    if nm is not None:
-        scores.append(-1 if nm > 0.15 else (1 if nm < 0.05 else 0))
-    roe = metrics.get("ROE")
-    if roe is not None:
-        scores.append(-1 if roe > 0.15 else (1 if roe < 0.05 else 0))
-    return np.mean(scores) if scores else 0
+# ---------------------------------------------------------------------------
+# Peer comparison metrics
+# ---------------------------------------------------------------------------
 
-
-def score_future(metrics):
-    scores = []
-    upside = metrics.get("Implied Upside")
-    if upside is not None:
-        scores.append(-1 if upside > 0.10 else (1 if upside < -0.05 else 0))
-    rec = metrics.get("Recommendation")
-    if rec:
-        if rec in ("strong_buy", "buy"):
-            scores.append(-1)
-        elif rec in ("sell", "strong_sell"):
-            scores.append(1)
-        else:
-            scores.append(0)
-    return np.mean(scores) if scores else 0
-
-
-def score_technicals(metrics):
-    scores = []
-    rsi = metrics.get("RSI (14)")
-    if rsi is not None:
-        scores.append(-1 if rsi < 30 else (1 if rsi > 70 else 0))
-    price = metrics.get("Current Price")
-    ma50 = metrics.get("50-Day MA")
-    ma200 = metrics.get("200-Day MA")
-    if price and ma50:
-        scores.append(-0.5 if price < ma50 else 0.5)
-    if price and ma200:
-        scores.append(-0.5 if price < ma200 else 0.5)
-    macd, macd_sig = metrics.get("MACD"), metrics.get("MACD Signal")
-    if macd is not None and macd_sig is not None:
-        scores.append(-0.5 if macd > macd_sig else 0.5)
-    return np.mean(scores) if scores else 0
-
-
-WEIGHTS = {
-    "Valuation": 0.35,
-    "Growth": 0.20,
-    "Profitability": 0.15,
-    "Future Outlook": 0.15,
-    "Technicals": 0.15,
+PEER_KEYS = {
+    "P/E":          ("trailingPE",                     False),
+    "Forward P/E":  ("forwardPE",                      False),
+    "P/B":          ("priceToBook",                    False),
+    "EV/EBITDA":    ("enterpriseToEbitda",             False),
+    "Net Margin":   ("profitMargins",                  True),
+    "Gross Margin": ("grossMargins",                   True),
+    "ROE":          ("returnOnEquity",                 True),
+    "Debt/Equity":  ("debtToEquity",                   False),
+    "Rev Growth":   ("revenueGrowth",                  True),
 }
 
-
-def composite_verdict(category_scores):
-    total = sum(category_scores[c] * WEIGHTS[c] for c in WEIGHTS)
-    if total <= -0.3:
-        verdict = "UNDERVALUED"
-        color = "green"
-    elif total >= 0.3:
-        verdict = "OVERVALUED"
-        color = "red"
-    else:
-        verdict = "FAIRLY VALUED"
-        color = "orange"
-    return total, verdict, color
-
-
 # ---------------------------------------------------------------------------
-# Streamlit UI
+# UI
 # ---------------------------------------------------------------------------
 
 st.set_page_config(page_title="Stock Analyzer", page_icon="📊", layout="wide")
-
 st.title("📊 Stock Analyzer")
-st.caption("Enter a ticker symbol to get a valuation verdict based on fundamentals, growth, profitability, analyst outlook, and technicals.")
+st.caption("Fundamentals · Growth · Profitability · DCF Valuation · Peer Comparison · Technicals")
 
-symbol = st.text_input("Ticker Symbol", value="AAPL").strip().upper()
-go_button = st.button("Analyze", type="primary")
+col_in, col_btn = st.columns([3, 1])
+with col_in:
+    symbol = st.text_input("Ticker Symbol", value="AAPL", label_visibility="collapsed").strip().upper()
+with col_btn:
+    go = st.button("Analyze", type="primary", use_container_width=True)
 
-if go_button and symbol:
+if go and symbol:
     with st.spinner(f"Fetching data for {symbol}..."):
-        data = get_ticker_data(symbol)
+        data = fetch_all(symbol)
 
-    if data is None:
-        st.error(f"No data found for '{symbol}'. Check the ticker symbol and try again.")
-    else:
-        info = data["info"]
+    if "error" in data:
+        st.error(data["error"])
+        st.stop()
 
-        # --- Header ---
-        st.header(f"{info.get('longName', symbol)} ({symbol})")
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Sector", info.get("sector", "N/A"))
-        col2.metric("Industry", info.get("industry", "N/A"))
-        col3.metric("Market Cap", fmt_money(info.get("marketCap")))
+    info    = data["info"]
+    hist    = data["hist"]
+    inc     = data["income_stmt"]
+    bal     = data["balance_sheet"]
+    cf_stmt = data["cashflow"]
 
-        # --- Compute everything ---
-        valuation = compute_valuation_metrics(info)
-        growth = compute_growth_metrics(info, data["income_stmt"])
-        profitability = compute_profitability_metrics(info)
-        health = compute_financial_health_metrics(info)
-        future = compute_future_expectations(info)
-        technicals = compute_technical_metrics(data["hist"])
+    # Header
+    name = info.get("longName", symbol)
+    price = sg(info, "currentPrice", "regularMarketPrice")
+    st.header(f"{name} ({symbol})")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Price",      f"${price}" if price else "N/A")
+    c2.metric("Market Cap", fmt_money(info.get("marketCap")))
+    c3.metric("Sector",     info.get("sector", "N/A"))
+    c4.metric("Industry",   info.get("industry", "N/A"))
 
-        cat_scores = {
-            "Valuation": score_valuation(valuation),
-            "Growth": score_growth(growth),
-            "Profitability": score_profitability(profitability),
-            "Future Outlook": score_future(future),
-            "Technicals": score_technicals(technicals),
-        }
-        total_score, verdict, color = composite_verdict(cat_scores)
+    # Compute
+    val  = compute_valuation(info)
+    grw  = compute_growth(info, inc)
+    prof = compute_profitability(info)
+    hlth = compute_health(info)
+    fut  = compute_future(info)
+    tech = compute_technicals(hist)
 
-        # --- Verdict banner ---
-        st.markdown("---")
-        v1, v2 = st.columns([1, 2])
-        with v1:
-            st.markdown(f"### Verdict: :{color}[{verdict}]")
-            st.markdown(f"**Composite Score:** {total_score:+.2f}  (range -1 to +1)")
-        with v2:
-            score_df = pd.DataFrame({
-                "Category": list(cat_scores.keys()),
-                "Score": list(cat_scores.values()),
-                "Weight": [f"{WEIGHTS[c]:.0%}" for c in cat_scores],
-            })
-            st.dataframe(score_df, hide_index=True, use_container_width=True)
+    cat_scores = {
+        "Valuation":     score_val(val),
+        "Growth":        score_growth(grw),
+        "Profitability": score_profit(prof),
+        "Future Outlook":score_future(fut),
+        "Technicals":    score_tech(tech),
+    }
+    total, verd, color = get_verdict(cat_scores)
 
-        st.caption("Score convention: -1 = undervalued/bullish signal, +1 = overvalued/bearish signal. This is a heuristic screen, not investment advice.")
+    # Verdict banner
+    st.markdown("---")
+    v1, v2 = st.columns([1, 2])
+    with v1:
+        st.markdown(f"### Verdict: :{color}[{verd}]")
+        st.markdown(f"**Composite Score:** {total:+.2f}  (−1 undervalued → +1 overvalued)")
+    with v2:
+        st.dataframe(pd.DataFrame({
+            "Category": list(cat_scores.keys()),
+            "Score":    [f"{v:+.2f}" for v in cat_scores.values()],
+            "Weight":   [f"{WEIGHTS[c]:.0%}" for c in cat_scores],
+        }), hide_index=True, use_container_width=True)
+    st.caption("Heuristic screen only — not investment advice.")
 
-        # --- Price chart ---
-        st.markdown("---")
-        st.subheader("Price Chart (2Y)")
-        hist = data["hist"]
+    # Price chart
+    st.markdown("---")
+    st.subheader("Price Chart (2Y)")
+    if not hist.empty:
         fig = go.Figure()
         fig.add_trace(go.Scatter(x=hist.index, y=hist["Close"], name="Close", line=dict(color="#1f77b4")))
         if len(hist) >= 50:
-            fig.add_trace(go.Scatter(x=hist.index, y=hist["Close"].rolling(50).mean(), name="50-Day MA", line=dict(color="orange", dash="dot")))
+            fig.add_trace(go.Scatter(x=hist.index, y=hist["Close"].rolling(50).mean(),
+                                     name="50-Day MA", line=dict(color="orange", dash="dot")))
         if len(hist) >= 200:
-            fig.add_trace(go.Scatter(x=hist.index, y=hist["Close"].rolling(200).mean(), name="200-Day MA", line=dict(color="red", dash="dot")))
-        fig.update_layout(height=400, margin=dict(l=20, r=20, t=20, b=20))
+            fig.add_trace(go.Scatter(x=hist.index, y=hist["Close"].rolling(200).mean(),
+                                     name="200-Day MA", line=dict(color="red", dash="dot")))
+        fig.update_layout(height=380, margin=dict(l=10, r=10, t=10, b=10))
         st.plotly_chart(fig, use_container_width=True)
 
-        # --- Detail sections ---
-        st.markdown("---")
-        tab1, tab2, tab3, tab4, tab5 = st.tabs(["Valuation", "Growth", "Profitability & Health", "Future Outlook", "Technicals"])
+    # -----------------------------------------------------------------------
+    # Tabs
+    # -----------------------------------------------------------------------
+    st.markdown("---")
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+        "Valuation", "Growth", "Profitability & Health",
+        "Future Outlook", "Technicals",
+        "📐 DCF Calculator", "👥 Peer Comparison"
+    ])
 
-        def show_table(metrics, pct_keys=None, money_keys=None):
-            pct_keys = pct_keys or []
-            money_keys = money_keys or []
+    PCT_GRW  = ["Revenue Growth (YoY)", "Earnings Growth (YoY)",
+                "Quarterly Earnings Growth (YoY)", "Revenue 3-4Y CAGR", "Net Income 3-4Y CAGR"]
+    PCT_PROF = ["Gross Margin", "Operating Margin", "Net Margin", "ROE", "ROA"]
+    PCT_FUT  = ["Implied Upside"]
+    PCT_TECH = ["% From 52W High", "% From 52W Low"]
+    MON_FUT  = ["Current Price", "Analyst Target Mean", "Analyst Target High", "Analyst Target Low"]
+    MON_TECH = ["Current Price", "50-Day MA", "200-Day MA", "52-Week High", "52-Week Low"]
+
+    with tab1: show_table(val)
+    with tab2: show_table(grw, pct_keys=PCT_GRW)
+    with tab3:
+        st.markdown("**Profitability**")
+        show_table(prof, pct_keys=PCT_PROF)
+        st.markdown("**Financial Health**")
+        show_table(hlth, money_keys=["Free Cash Flow"])
+    with tab4: show_table(fut, pct_keys=PCT_FUT, money_keys=MON_FUT)
+    with tab5: show_table(tech, pct_keys=PCT_TECH, money_keys=MON_TECH)
+
+    # -----------------------------------------------------------------------
+    # DCF Calculator
+    # -----------------------------------------------------------------------
+    with tab6:
+        st.subheader("📐 DCF Intrinsic Value Calculator")
+        st.caption("Adjust the sliders. The model projects free cash flows and discounts them back to today.")
+
+        # Pull defaults from yfinance
+        try:
+            base_fcf  = cf_stmt.loc["Free Cash Flow"].iloc[0]  if cf_stmt is not None and not cf_stmt.empty  else None
+        except Exception:
+            base_fcf  = sg(info, "freeCashflow")
+        try:
+            base_rev  = inc.loc["Total Revenue"].iloc[0] if inc is not None and not inc.empty else None
+        except Exception:
+            base_rev  = sg(info, "totalRevenue")
+
+        shares    = sg(info, "sharesOutstanding", "impliedSharesOutstanding")
+        try:
+            total_debt = bal.loc["Total Debt"].iloc[0]  if bal is not None and not bal.empty else 0
+        except Exception:
+            total_debt = 0
+        try:
+            cash_val   = bal.loc["Cash And Cash Equivalents"].iloc[0] if bal is not None and not bal.empty else 0
+        except Exception:
+            cash_val   = sg(info, "totalCash", default=0)
+
+        net_debt  = (total_debt or 0) - (cash_val or 0)
+        cur_price = sg(info, "currentPrice", "regularMarketPrice")
+
+        st.markdown("**Company Financials (auto-filled from latest filings)**")
+        d1, d2, d3, d4 = st.columns(4)
+        d1.metric("Latest FCF",     fmt_money(base_fcf))
+        d2.metric("Latest Revenue", fmt_money(base_rev))
+        d3.metric("Net Debt",       fmt_money(net_debt))
+        d4.metric("Shares Out.",    fmt_money(shares))
+
+        st.markdown("**Your Assumptions**")
+        a1, a2, a3, a4 = st.columns(4)
+        growth_rate     = a1.slider("FCF Growth Rate",     0, 40, 10, 1, format="%d%%") / 100
+        terminal_growth = a2.slider("Terminal Growth Rate", 0, 5, 2, format="%d%%") / 100
+        discount_rate   = a3.slider("Discount Rate (WACC)", 5, 20, 10, 1, format="%d%%") / 100
+        proj_years      = a4.slider("Projection Years",    5, 15, 10)
+
+        if discount_rate <= terminal_growth:
+            st.error("Discount rate must be greater than terminal growth rate.")
+        else:
+            intrinsic, cf_rows, tv_pv = run_dcf(
+                base_fcf, base_rev, growth_rate, terminal_growth,
+                discount_rate, proj_years, shares, net_debt
+            )
+
+            if intrinsic is None:
+                st.warning("Not enough data to run DCF — missing FCF or share count.")
+            else:
+                mos = (intrinsic - cur_price) / intrinsic if cur_price else None
+                r1, r2, r3 = st.columns(3)
+                r1.metric("Intrinsic Value / Share", f"${intrinsic:.2f}")
+                r2.metric("Current Price", f"${cur_price:.2f}" if cur_price else "N/A")
+                if mos is not None:
+                    lbl = "Upside" if mos > 0 else "Downside"
+                    tag = "Undervalued" if mos > 0 else "Overvalued"
+                    r3.metric(lbl, f"{mos * 100:.1f}%", delta=tag,
+                              delta_color="normal" if mos > 0 else "inverse")
+
+                # Bar chart
+                st.markdown("**Present Value Breakdown**")
+                df_cf = pd.DataFrame(cf_rows)
+                fig_d = go.Figure(go.Bar(
+                    x=df_cf["Year"].tolist() + ["Terminal Value"],
+                    y=df_cf["PV ($M)"].tolist() + [tv_pv],
+                    marker_color=["#1f77b4"] * len(df_cf) + ["#ff7f0e"]
+                ))
+                fig_d.update_layout(title="PV of Projected FCFs + Terminal Value ($M)",
+                                    height=340, margin=dict(l=10, r=10, t=40, b=10))
+                st.plotly_chart(fig_d, use_container_width=True)
+
+                # Sensitivity table
+                st.markdown("**Sensitivity Table — Intrinsic Value / Share**")
+                g_range = [round(growth_rate + d, 2) for d in [-0.04, -0.02, 0, 0.02, 0.04]]
+                d_range = [round(discount_rate + d, 3) for d in [-0.02, -0.01, 0, 0.01, 0.02]]
+                d_valid = [d for d in d_range if d > terminal_growth and d > 0]
+
+                sens = {}
+                for dr in d_valid:
+                    col_vals = []
+                    for gr in g_range:
+                        iv, _, _ = run_dcf(base_fcf, base_rev, gr, terminal_growth,
+                                           dr, proj_years, shares, net_debt)
+                        col_vals.append(f"${iv:.0f}" if iv else "N/A")
+                    sens[f"WACC {dr*100:.1f}%"] = col_vals
+
+                sens_df = pd.DataFrame(sens, index=[f"Growth {g*100:.0f}%" for g in g_range])
+                st.dataframe(sens_df, use_container_width=True)
+                st.caption("Rows = FCF growth rate assumption | Columns = discount rate (WACC)")
+
+    # -----------------------------------------------------------------------
+    # Peer Comparison
+    # -----------------------------------------------------------------------
+    with tab7:
+        st.subheader("👥 Peer Comparison")
+
+        # yfinance provides recommended peers in some tickers
+        peers_raw = []
+        try:
+            recs = data.get("recommendations")
+            # Try getting industry peers from info
+            pass
+        except Exception:
+            pass
+
+        # Let user input peers (yfinance doesn't auto-provide peer lists)
+        default_peers = ", ".join({
+            "AAPL": "MSFT, GOOGL, META, AMZN",
+            "TSLA": "F, GM, RIVN, NIO",
+            "MSFT": "AAPL, GOOGL, AMZN, CRM",
+            "AMZN": "MSFT, GOOGL, BABA, WMT",
+            "GOOGL": "MSFT, META, AMZN, AAPL",
+            "META":  "GOOGL, SNAP, PINS, TWTR",
+            "NVDA":  "AMD, INTC, QCOM, TSM",
+            "JPM":   "BAC, GS, MS, WFC",
+            "JNJ":   "PFE, MRK, ABT, UNH",
+            "XOM":   "CVX, BP, SHEL, COP",
+        }.get(symbol, ""))
+
+        peer_input = st.text_input(
+            "Enter peer tickers (comma-separated)",
+            value=default_peers,
+            help="Type the ticker symbols of competitors you want to compare against"
+        )
+        run_peers = st.button("Compare Peers", type="secondary")
+
+        if run_peers and peer_input:
+            peers = [p.strip().upper() for p in peer_input.split(",") if p.strip()][:6]
+
+            with st.spinner(f"Fetching data for {', '.join(peers)}..."):
+                peer_infos = {symbol: info}
+                for p in peers:
+                    peer_infos[p] = fetch_peer(p)
+
+            # Comparison table
             rows = []
-            for k, v in metrics.items():
-                if k in pct_keys:
-                    display = fmt_pct(v)
-                elif k in money_keys:
-                    display = fmt_money(v)
-                elif isinstance(v, float):
-                    display = fmt_num(v)
-                else:
-                    display = v if v is not None else "N/A"
-                rows.append({"Metric": k, "Value": display})
-            st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+            for ticker, inf in peer_infos.items():
+                if not inf: continue
+                row = {
+                    "Ticker": ticker,
+                    "Name":   (inf.get("longName") or ticker)[:22],
+                    "Mkt Cap": fmt_money(inf.get("marketCap")),
+                }
+                for label, (key, is_pct) in PEER_KEYS.items():
+                    v = sg(inf, key)
+                    row[label] = (fmt_pct(v) if is_pct else fmt_num(v)) if v is not None else "N/A"
+                rows.append(row)
 
-        with tab1:
-            show_table(valuation)
+            comp_df = pd.DataFrame(rows).set_index("Ticker")
+            st.dataframe(comp_df, use_container_width=True)
 
-        with tab2:
-            show_table(growth, pct_keys=["Revenue Growth (YoY)", "Earnings Growth (YoY)",
-                                          "Quarterly Earnings Growth (YoY)", "Revenue 3-4Y CAGR", "Net Income 3-4Y CAGR"])
+            # Bar charts
+            st.markdown("**Visual Comparison**")
+            chart_cols = st.columns(2)
+            chart_metrics = ["P/E", "EV/EBITDA", "Net Margin", "ROE"]
 
-        with tab3:
-            st.markdown("**Profitability**")
-            show_table(profitability, pct_keys=["Gross Margin", "Operating Margin", "Net Margin", "ROE", "ROA"])
-            st.markdown("**Financial Health**")
-            show_table(health, money_keys=["Free Cash Flow"])
+            for i, metric in enumerate(chart_metrics):
+                key, is_pct = PEER_KEYS[metric]
+                chart_data = []
+                for ticker, inf in peer_infos.items():
+                    v = sg(inf, key)
+                    if v is not None and isinstance(v, (int, float)) and not np.isnan(v):
+                        chart_data.append({"Ticker": ticker, "Value": v * 100 if is_pct else v})
 
-        with tab4:
-            show_table(future, pct_keys=["Implied Upside"], money_keys=["Current Price", "Analyst Target Mean", "Analyst Target High", "Analyst Target Low"])
+                if chart_data:
+                    cdf = pd.DataFrame(chart_data).sort_values("Value")
+                    bar_colors = ["#e74c3c" if r == symbol else "#3498db" for r in cdf["Ticker"]]
+                    fig = go.Figure(go.Bar(x=cdf["Ticker"], y=cdf["Value"], marker_color=bar_colors))
+                    fig.update_layout(
+                        title=f"{metric}{' (%)' if is_pct else ''}  — red = {symbol}",
+                        height=280, showlegend=False,
+                        margin=dict(l=10, r=10, t=40, b=10)
+                    )
+                    chart_cols[i % 2].plotly_chart(fig, use_container_width=True)
 
-        with tab5:
-            show_table(technicals, pct_keys=["% From 52W High", "% From 52W Low"], money_keys=["Current Price", "50-Day MA", "200-Day MA", "52-Week High", "52-Week Low"])
+            # Percentile ranking
+            st.markdown(f"**{symbol} Percentile Ranking vs Peers**")
+            pct_rows = []
+            for label, (key, is_pct) in PEER_KEYS.items():
+                vals = {}
+                for ticker, inf in peer_infos.items():
+                    v = sg(inf, key)
+                    if v is not None and isinstance(v, (int, float)) and not np.isnan(v):
+                        vals[ticker] = v
+
+                if symbol in vals and len(vals) > 1:
+                    main_val = vals[symbol]
+                    sorted_vals = sorted(vals.values())
+                    rank = sorted_vals.index(main_val) + 1
+                    n    = len(sorted_vals)
+                    # Higher is better for margins/returns; lower is better for valuation ratios
+                    pct_rank = (rank / n * 100) if is_pct else ((n - rank + 1) / n * 100)
+                    interp = ("✅ Better than most peers" if pct_rank >= 60
+                              else "⚠️ Middle of the pack" if pct_rank >= 40
+                              else "🔴 Lags most peers")
+                    pct_rows.append({
+                        "Metric":              label,
+                        f"{symbol} Value":     fmt_pct(main_val) if is_pct else fmt_num(main_val),
+                        "Percentile":          f"{pct_rank:.0f}th",
+                        "Interpretation":      interp,
+                    })
+
+            if pct_rows:
+                st.dataframe(pd.DataFrame(pct_rows), hide_index=True, use_container_width=True)
+        else:
+            st.info("Enter peer tickers above and click **Compare Peers** to run the comparison.")
 
 else:
-    st.info("Enter a ticker symbol and click Analyze to get started.")
+    st.info("Enter a ticker symbol above and click **Analyze** to get started.")
