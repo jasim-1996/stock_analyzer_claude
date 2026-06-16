@@ -2,12 +2,11 @@
 Stock Analyzer - Web App (Streamlit)
 
 Run locally:
-    pip install streamlit yfinance pandas numpy ta plotly requests
+    pip install streamlit yfinance pandas numpy ta plotly requests requests-cache
     streamlit run app.py
 
 Deploy on Streamlit Cloud:
     Push app.py + requirements.txt to GitHub, connect at share.streamlit.io
-    The yfinance rate-limit fix (fake browser session) is built in.
 """
 
 import numpy as np
@@ -18,30 +17,24 @@ import ta
 import plotly.graph_objects as go
 import plotly.express as px
 import requests
+import requests_cache
 
 # ---------------------------------------------------------------------------
-# yfinance rate-limit fix: use a real browser session so Streamlit Cloud
-# doesn't get blocked by Yahoo Finance
+# Rate-limit fix: cache all yfinance HTTP requests to disk for 24 hours.
+# Yahoo Finance is only hit once per ticker per day — every repeat lookup
+# is served from the local SQLite cache instantly (no 429 errors).
 # ---------------------------------------------------------------------------
-
-def make_yf_session():
-    session = requests.Session()
-    session.headers.update({
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/120.0.0.0 Safari/537.36"
-        ),
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.5",
-    })
-    return session
+requests_cache.install_cache(
+    cache_name="yf_cache",
+    backend="sqlite",
+    expire_after=86400,   # 24 hours
+    allowable_codes=[200],
+)
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_all(symbol):
     try:
-        session = make_yf_session()
-        t = yf.Ticker(symbol, session=session)
+        t = yf.Ticker(symbol)
         info = t.info
         if not info or (info.get("regularMarketPrice") is None and info.get("currentPrice") is None):
             return {"error": f"No data found for '{symbol}'. Check the ticker."}
@@ -60,8 +53,7 @@ def fetch_all(symbol):
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_peer(ticker):
     try:
-        session = make_yf_session()
-        t = yf.Ticker(ticker, session=session)
+        t = yf.Ticker(ticker)
         return t.info or {}
     except Exception:
         return {}
