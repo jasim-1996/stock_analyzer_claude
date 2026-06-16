@@ -314,9 +314,9 @@ col_in, col_btn = st.columns([3, 1])
 with col_in:
     symbol = st.text_input("Ticker Symbol", value="AAPL", label_visibility="collapsed").strip().upper()
 with col_btn:
-    go = st.button("Analyze", type="primary", use_container_width=True)
+    analyze = st.button("Analyze", type="primary", use_container_width=True)
 
-if go and symbol:
+if analyze and symbol:
     with st.spinner(f"Fetching data for {symbol}..."):
         data = fetch_all(symbol)
 
